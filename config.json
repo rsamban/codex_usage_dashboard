@@ -1,0 +1,22 @@
+{
+  "timezone": "America/Denver",
+  "codex_home": "~/.codex",
+  "include_archived": true,
+  "chatgpt": {
+    "mode": "fixed",
+    "fixed_message_credits": 10,
+    "pro_message_credits": 50,
+    "unlimited_models": ["Instant", "GPT-5.6 Luna"]
+  },
+  "rates": {
+    "GPT-5.6 Sol": {"input": 100, "cached": 10, "cache_write": 100, "output": 500},
+    "GPT-5.6 Terra": {"input": 50, "cached": 5, "cache_write": 50, "output": 300},
+    "GPT-5.6 Luna": {"input": 5, "cached": 0.5, "cache_write": 5, "output": 30},
+    "GPT-5.5": {"input": 125, "cached": 12.5, "cache_write": 125, "output": 750},
+    "GPT-5.4": {"input": 62.5, "cached": 6.25, "cache_write": 62.5, "output": 375},
+    "GPT-5.4 mini": {"input": 18.75, "cached": 1.875, "cache_write": 18.75, "output": 113},
+    "GPT-5.3-Codex": {"input": 43.75, "cached": 4.375, "cache_write": 43.75, "output": 350},
+    "GPT-5.2": {"input": 43.75, "cached": 4.375, "cache_write": 43.75, "output": 350},
+    "default": {"input": 100, "cached": 10, "cache_write": 100, "output": 500}
+  }
+}

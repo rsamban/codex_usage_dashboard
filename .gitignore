@@ -1,0 +1,4 @@
+__pycache__/
+imports/*.csv
+imports/*.json
+.DS_Store
