@@ -179,6 +179,15 @@ def classify_prompt(prompt):
     return "other"
 
 
+def is_approval_response(prompt):
+    """Identify explicit approval-only follow-ups without sending text elsewhere."""
+    text = re.sub(r"\s+", " ", prompt or "").strip().lower()
+    if not text:
+        return False
+    short = r"(y|yes|ok|okay|approve|approved|allow|continue|proceed|go ahead|run it|do it|permission granted)[.!]?"
+    return bool(re.fullmatch(short, text) or text.startswith(("approved command", "approval granted")))
+
+
 def estimate_credits(model, usage, config=None):
     config = config or CONFIG
     rates = config.get("rates", {})
@@ -224,7 +233,7 @@ def iter_rollout_files(codex_home, include_archived=True):
     yield from sorted(found, key=lambda item: str(item[0]))
 
 
-def _new_turn(timestamp, turn_id, meta, lifecycle, prompt="", prompt_source=None):
+def _new_turn(timestamp, turn_id, meta, lifecycle, prompt="", prompt_source=None, prompt_client_id=None):
     workspace = meta.get("cwd") or ""
     return {
         "timestamp": timestamp.isoformat() if timestamp else None,
@@ -235,8 +244,11 @@ def _new_turn(timestamp, turn_id, meta, lifecycle, prompt="", prompt_source=None
         "project": Path(workspace).name if workspace else "",
         "prompt": prompt,
         "prompt_source": prompt_source,
+        "prompt_client_id": prompt_client_id,
         "usage": empty_usage(),
         "usage_methods": set(),
+        "model_requests": 0,
+        "approval_requests": 0,
         "lifecycle": lifecycle,
         "rate_limits": {},
     }
@@ -267,11 +279,11 @@ def parse_rollout(path, archived=False, config=None):
     sequence = 0
     latest_rate_limits = {}
 
-    def set_prompt(turn, text, source, ts):
+    def set_prompt(turn, text, source, ts, client_id=None):
         nonlocal pending
         if not text or is_private_context(text):
             return
-        candidate = {"text": text, "source": source, "timestamp": ts}
+        candidate = {"text": text, "source": source, "timestamp": ts, "client_id": client_id}
         if turn is None:
             # event_msg is the canonical user event when both representations exist.
             if pending is None or source == "event_msg" or pending.get("source") != "event_msg":
@@ -280,6 +292,7 @@ def parse_rollout(path, archived=False, config=None):
         if not turn["prompt"] or source == "event_msg" and turn.get("prompt_source") != "event_msg":
             turn["prompt"] = text
             turn["prompt_source"] = source
+            turn["prompt_client_id"] = client_id or turn.get("prompt_client_id")
 
     def finish(turn, status, end_ts=None):
         nonlocal sequence
@@ -315,6 +328,10 @@ def parse_rollout(path, archived=False, config=None):
             "status": status,
             "usage_available": usage_available,
             "usage_source": "+".join(sorted(turn["usage_methods"])) if turn["usage_methods"] else None,
+            "model_requests": turn.get("model_requests", 0),
+            "approval_requests": turn.get("approval_requests", 0),
+            "_prompt_client_id": turn.get("prompt_client_id"),
+            "_approval_response": is_approval_response(prompt),
             "non_cached_input_tokens": max(0, num(usage["input_tokens"]) - num(usage["cached_input_tokens"])),
             "file": str(path),
             "archived": archived,
@@ -361,6 +378,10 @@ def parse_rollout(path, archived=False, config=None):
                         active["reasoning_effort"] = meta["effort"]
                         active["workspace"] = meta["cwd"]
                         active["project"] = Path(meta["cwd"]).name if meta["cwd"] else ""
+                elif top_type == "response_item" and payload_type in ("custom_tool_call", "function_call"):
+                    raw_input = payload.get("input") if payload_type == "custom_tool_call" else payload.get("arguments")
+                    if active is not None and "require_escalated" in str(raw_input or "").lower():
+                        active["approval_requests"] += 1
                 elif top_type == "response_item" and payload_type == "message" and payload.get("role") == "user":
                     set_prompt(active, first_text(payload), "response_item", timestamp)
                 elif top_type == "event_msg" and payload_type == "user_message":
@@ -368,14 +389,15 @@ def parse_rollout(path, archived=False, config=None):
                     if active is not None and active["lifecycle"] == "inferred":
                         finish(active, "inferred", timestamp)
                         active = None
-                    set_prompt(active, text, "event_msg", timestamp)
+                    set_prompt(active, text, "event_msg", timestamp, payload.get("client_id"))
                 elif top_type == "event_msg" and payload_type == "task_started":
                     if active is not None:
                         finish(active, "incomplete", timestamp)
                     prompt = pending["text"] if pending else ""
                     prompt_source = pending["source"] if pending else None
+                    prompt_client_id = pending.get("client_id") if pending else None
                     start_ts = timestamp or (pending.get("timestamp") if pending else None)
-                    active = _new_turn(start_ts, payload.get("turn_id"), meta, True, prompt, prompt_source)
+                    active = _new_turn(start_ts, payload.get("turn_id"), meta, True, prompt, prompt_source, prompt_client_id)
                     pending = None
                 elif top_type == "event_msg" and payload_type == "token_count":
                     if isinstance(payload.get("rate_limits"), dict):
@@ -410,13 +432,14 @@ def parse_rollout(path, archived=False, config=None):
                     if increment is None:
                         continue
                     if active is None and pending is not None:
-                        active = _new_turn(pending.get("timestamp") or timestamp, None, meta, "inferred", pending["text"], pending["source"])
+                        active = _new_turn(pending.get("timestamp") or timestamp, None, meta, "inferred", pending["text"], pending["source"], pending.get("client_id"))
                         pending = None
                     if active is None:
                         diag["unassigned_token_events"] += 1
                         continue
                     add_usage(active["usage"], increment)
                     active["usage_methods"].add(method)
+                    active["model_requests"] += 1
                 elif top_type == "event_msg" and payload_type in ("task_complete", "turn_aborted"):
                     if active is not None:
                         active["turn_id"] = payload.get("turn_id") or active.get("turn_id")
@@ -426,11 +449,25 @@ def parse_rollout(path, archived=False, config=None):
         if active is not None:
             finish(active, "incomplete" if active["lifecycle"] is True else "inferred")
         elif pending is not None:
-            orphan = _new_turn(pending.get("timestamp"), None, meta, "inferred", pending["text"], pending["source"])
+            orphan = _new_turn(pending.get("timestamp"), None, meta, "inferred", pending["text"], pending["source"], pending.get("client_id"))
             finish(orphan, "incomplete")
         diag["parsed"] = True
     except (OSError, EOFError, UnicodeError) as exc:
         diag["read_error"] = type(exc).__name__
+
+    current_prompt = None
+    for request in requests:
+        approval_followup = request.pop("_approval_response", False)
+        client_id = request.pop("_prompt_client_id", None)
+        if not approval_followup or current_prompt is None:
+            stable_prompt = client_id or request["id"]
+            current_prompt = {
+                "id": hashlib.sha256(f"prompt|{path}|{stable_prompt}".encode()).hexdigest()[:24],
+                "preview": request.get("prompt_preview") or "",
+            }
+        request["prompt_id"] = current_prompt["id"]
+        request["root_prompt_preview"] = current_prompt["preview"]
+        request["is_approval_followup"] = approval_followup
 
     diag["unknown_event_types"] = dict(diag["unknown_event_types"])
     diag["unknown_payload_types"] = dict(diag["unknown_payload_types"])
@@ -473,14 +510,17 @@ def parse_import_file(path, config=None):
             else:
                 credits = config["chatgpt"].get("fixed_message_credits", 10)
         preview = human_preview(row.get("prompt") or row.get("message") or row.get("title") or "")
+        request_id = hashlib.sha256(f"{path}|{index}".encode()).hexdigest()[:24]
         output.append({
-            "id": hashlib.sha256(f"{path}|{index}".encode()).hexdigest()[:24],
+            "id": request_id, "prompt_id": request_id,
             "source": source, "source_confidence": "locally estimated", "timestamp": parsed.isoformat() if parsed else str(timestamp),
             "session_id": None, "thread_id": None, "turn_id": None, "model": model,
             "reasoning_effort": row.get("reasoning_effort"), "prompt_preview": preview,
+            "root_prompt_preview": preview, "is_approval_followup": False,
             "category": category, "kind": "coding" if category in {"coding", "code review", "debugging", "testing"} else "chat",
             "workspace": row.get("workspace") or "", "project": row.get("project") or "",
             "status": "imported", "usage_available": any(usage.values()), "usage_source": "import",
+            "model_requests": 1, "approval_requests": 0,
             "non_cached_input_tokens": max(0, usage["input_tokens"] - usage["cached_input_tokens"]),
             "file": str(path), "archived": False, "rate_limits": {},
             "estimated_credits": round(credits, 6), **{key: integerish(value) for key, value in usage.items()},
@@ -543,6 +583,7 @@ class SessionIndex:
             for diag in file_diags:
                 if diag.get("latest_rate_limits"):
                     latest_limits = diag["latest_rate_limits"]
+            prompts = aggregate_prompts(requests)
             self.last_diagnostics = {
                 "session_files_discovered": len(discovered),
                 "session_files_parsed": sum(bool(diag.get("parsed")) for diag in file_diags),
@@ -550,6 +591,9 @@ class SessionIndex:
                 "archived_files": sum(archived for _, archived in discovered),
                 "parse_errors": sum(diag.get("parse_errors", 0) for diag in file_diags),
                 "sessions": len(session_ids), "requests": len(requests),
+                "prompts": len(prompts),
+                "model_requests": sum(item.get("model_requests", 0) for item in requests),
+                "approval_requests": sum(item.get("approval_requests", 0) for item in requests),
                 "oldest_request": min(dated) if dated else None, "newest_request": max(dated) if dated else None,
                 "unknown_event_types": dict(unknown), "unknown_payload_types": dict(unknown_payload),
                 "files_with_unknown_event_types": sum(bool(diag.get("unknown_event_types") or diag.get("unknown_payload_types")) for diag in file_diags),
@@ -661,6 +705,77 @@ def filter_requests(requests, query):
     return sorted(rows, key=lambda row: (row.get(sort) is not None, row.get(sort) or ""), reverse=descending)
 
 
+def aggregate_prompts(requests):
+    """Roll request/turn records up to the root user prompt that initiated them."""
+    groups = {}
+    for row in requests:
+        prompt_id = row.get("prompt_id") or row["id"]
+        if prompt_id not in groups:
+            groups[prompt_id] = {
+                "id": prompt_id, "timestamp": row.get("timestamp"), "end_timestamp": row.get("timestamp"),
+                "source": row.get("source"), "source_confidence": row.get("source_confidence"),
+                "prompt_preview": row.get("root_prompt_preview") or row.get("prompt_preview") or "",
+                "project": row.get("project") or "", "workspace": row.get("workspace") or "",
+                "category": row.get("category") or "other", "kind": row.get("kind") or "chat",
+                "models": set(), "reasoning_efforts": set(), "statuses": set(), "request_ids": [],
+                "request_count": 0, "model_requests": 0, "approval_requests": 0,
+                "usage_available": False, "estimated_credits": 0.0,
+                "non_cached_input_tokens": 0.0,
+                **empty_usage(),
+            }
+        group = groups[prompt_id]
+        group["end_timestamp"] = max(group.get("end_timestamp") or "", row.get("timestamp") or "")
+        if row.get("model"):
+            group["models"].add(row["model"])
+        if row.get("reasoning_effort"):
+            group["reasoning_efforts"].add(row["reasoning_effort"])
+        if row.get("status"):
+            group["statuses"].add(row["status"])
+        group["request_ids"].append(row["id"])
+        group["request_count"] += 1
+        group["model_requests"] += int(num(row.get("model_requests")))
+        group["approval_requests"] += int(num(row.get("approval_requests")))
+        group["usage_available"] = group["usage_available"] or bool(row.get("usage_available"))
+        group["estimated_credits"] += num(row.get("estimated_credits"))
+        group["non_cached_input_tokens"] += num(row.get("non_cached_input_tokens"))
+        for key in TOKEN_KEYS:
+            group[key] += num(row.get(key))
+    output = []
+    for group in groups.values():
+        group["model"] = ", ".join(sorted(group.pop("models"))) or "unknown"
+        group["reasoning_effort"] = ", ".join(sorted(group.pop("reasoning_efforts")))
+        group["status"] = ", ".join(sorted(group.pop("statuses")))
+        group["estimated_credits"] = round(group["estimated_credits"], 6)
+        group["non_cached_input_tokens"] = integerish(group["non_cached_input_tokens"])
+        for key in TOKEN_KEYS:
+            group[key] = integerish(group[key])
+        output.append(group)
+    return output
+
+
+def filter_prompts(prompts, query):
+    source = query.get("source", ["all"])[0]
+    category = query.get("category", ["all"])[0]
+    search = query.get("q", [""])[0].strip().lower()
+    rows = prompts
+    if source != "all":
+        rows = [row for row in rows if row.get("source") == source]
+    if category != "all":
+        rows = [row for row in rows if row.get("category") == category]
+    if search:
+        fields = ("prompt_preview", "project", "workspace", "model", "reasoning_effort", "category")
+        rows = [row for row in rows if any(search in str(row.get(field) or "").lower() for field in fields)]
+    sort = query.get("sort", ["timestamp"])[0]
+    allowed = {
+        "timestamp", "model", "category", "project", "request_count", "model_requests",
+        "approval_requests", "input_tokens", "cached_input_tokens", "output_tokens",
+        "reasoning_output_tokens", "total_tokens", "estimated_credits",
+    }
+    sort = sort if sort in allowed else "timestamp"
+    descending = query.get("order", ["desc"])[0] != "asc"
+    return sorted(rows, key=lambda row: (row.get(sort) is not None, row.get(sort) or ""), reverse=descending)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -700,6 +815,23 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 30
             return self.send_json({"mode": mode, "rows": timeline(filtered, mode, limit)})
+        if parsed.path == "/api/prompts":
+            requests, _ = INDEX.refresh()
+            prompts = filter_prompts(aggregate_prompts(requests), query)
+            try:
+                limit = max(1, min(int(query.get("limit", ["1000"])[0]), 5000))
+                offset = max(0, int(query.get("offset", ["0"])[0]))
+            except ValueError:
+                limit, offset = 1000, 0
+            return self.send_json({"prompts": prompts[offset:offset + limit], "total_count": len(prompts)})
+        if parsed.path == "/api/prompt":
+            requests, _ = INDEX.refresh()
+            prompt_id = query.get("id", [""])[0]
+            prompt = next((item for item in aggregate_prompts(requests) if item.get("id") == prompt_id), None)
+            if prompt is None:
+                return self.send_json({"error": "prompt not found"}, 404)
+            prompt["requests"] = [row for row in requests if row.get("prompt_id") == prompt_id]
+            return self.send_json(prompt)
         if parsed.path == "/api/diagnostics":
             _, diagnostics = INDEX.refresh()
             return self.send_json(diagnostics)

@@ -73,7 +73,30 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(rows[0]["reasoning_output_tokens"], 5)
         self.assertEqual(rows[0]["total_tokens"], 120)
         self.assertEqual(rows[0]["reasoning_effort"], "medium")
+        self.assertEqual(rows[0]["model_requests"], 1)
         self.assertNotIn("prompt", rows[0])
+
+    def test_prompt_aggregation_includes_approval_followup_and_model_calls(self):
+        lines = common_start("turn-1", "Implement the requested dashboard") + [
+            token(usage(100, 20, 10)),
+            event("response_item", {"type": "function_call", "name": "exec_command", "arguments": json.dumps({"sandbox_permissions": "require_escalated", "justification": "Allow local test"})}),
+            token(usage(160, 40, 15), usage(60, 20, 5)),
+            event("event_msg", {"type": "task_complete", "turn_id": "turn-1"}),
+            event("event_msg", {"type": "task_started", "turn_id": "turn-2"}),
+            event("turn_context", {"turn_id": "turn-2", "model": "gpt-5.6-sol", "effort": "medium"}),
+            event("event_msg", {"type": "user_message", "message": "Approved"}),
+            token(usage(200, 50, 20), usage(40, 10, 5)),
+            event("event_msg", {"type": "task_complete", "turn_id": "turn-2"}),
+        ]
+        rows, _ = self.parse(lines)
+        prompts = dashboard.aggregate_prompts(rows)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0]["request_count"], 2)
+        self.assertEqual(prompts[0]["model_requests"], 3)
+        self.assertEqual(prompts[0]["approval_requests"], 1)
+        self.assertEqual(prompts[0]["total_tokens"], 220)
+        self.assertEqual(prompts[0]["prompt_preview"], "Implement the requested dashboard")
 
     def test_multiple_requests_in_one_session(self):
         first = common_start("turn-1", "Implement feature") + [

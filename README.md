@@ -30,6 +30,11 @@ One dashboard row represents one Codex request/turn:
 - Per-turn usage is the sum of advances in `total_token_usage`; `last_token_usage` is used only when cumulative data is absent or resets.
 - Incomplete or tokenless requests remain visible and are flagged by diagnostics.
 
+Prompt Explorer adds a second roll-up level. It totals every contributing turn and
+advancing token snapshot/model call for the root user prompt, counts locally detected
+permission-approval tool calls, and attaches explicit approval-only follow-up turns to
+the preceding prompt. Request Explorer remains available for the underlying turn rows.
+
 Only a whitespace-normalized 180-character user-request preview is retained in the in-memory index and returned to the UI. Assistant responses, reasoning text, tool inputs/outputs, environment content, and full prompt bodies are not retained or logged.
 
 ## Recorded tokens versus estimated credits
@@ -54,6 +59,8 @@ non-cached input × input rate
 ## API
 
 - `GET /api/data` — summaries, searchable/sortable request rows, and diagnostics
+- `GET /api/prompts` — searchable/sortable root-prompt totals
+- `GET /api/prompt?id=...` — one prompt total plus its contributing request rows
 - `GET /api/timeline?mode=hour|day|week|month` — time buckets
 - `GET /api/request?id=...` — safe details for one indexed request
 - `GET /api/diagnostics` — discovery, parser, and data-quality counters
