@@ -233,7 +233,7 @@ def iter_rollout_files(codex_home, include_archived=True):
     yield from sorted(found, key=lambda item: str(item[0]))
 
 
-def _new_turn(timestamp, turn_id, meta, lifecycle, prompt="", prompt_source=None, prompt_client_id=None):
+def _new_turn(timestamp, turn_id, meta, lifecycle, prompt="", prompt_source=None, prompt_client_id=None, replayed=False):
     workspace = meta.get("cwd") or ""
     return {
         "timestamp": timestamp.isoformat() if timestamp else None,
@@ -249,6 +249,7 @@ def _new_turn(timestamp, turn_id, meta, lifecycle, prompt="", prompt_source=None
         "usage_methods": set(),
         "model_requests": 0,
         "approval_requests": 0,
+        "replayed": replayed,
         "lifecycle": lifecycle,
         "rate_limits": {},
     }
@@ -278,6 +279,9 @@ def parse_rollout(path, archived=False, config=None):
     previous_total = None
     sequence = 0
     latest_rate_limits = {}
+    native_session_id = None
+    native_session_timestamp = None
+    subagent_parent_thread_id = None
 
     def set_prompt(turn, text, source, ts, client_id=None):
         nonlocal pending
@@ -307,7 +311,11 @@ def parse_rollout(path, archived=False, config=None):
             diag["request_usage_missing"] += 1
         prompt = turn.get("prompt") or ""
         category = classify_prompt(prompt)
+        is_subagent = bool(subagent_parent_thread_id)
+        is_replayed = bool(is_subagent and turn.get("replayed"))
         session_id = meta.get("session_id")
+        if is_subagent and not is_replayed:
+            session_id = native_session_id or session_id
         turn_id = turn.get("turn_id")
         stable = f"{path}|{session_id}|{turn_id}|{sequence}"
         record = {
@@ -321,6 +329,9 @@ def parse_rollout(path, archived=False, config=None):
             "model": normalize_model(turn.get("model") or meta.get("model")),
             "reasoning_effort": turn.get("reasoning_effort") or meta.get("effort"),
             "prompt_preview": human_preview(prompt),
+            # A short normalized fingerprint survives local handoff/retry wrappers that
+            # append different environment context to the same human-entered prompt.
+            "prompt_fingerprint": hashlib.sha256(human_preview(prompt).encode()).hexdigest() if prompt else None,
             "category": category,
             "kind": "coding" if category in {"coding", "code review", "debugging", "testing"} else "chat",
             "workspace": turn.get("workspace") or meta.get("cwd") or "",
@@ -336,6 +347,9 @@ def parse_rollout(path, archived=False, config=None):
             "file": str(path),
             "archived": archived,
             "rate_limits": turn.get("rate_limits") or latest_rate_limits,
+            "is_subagent": is_subagent,
+            "is_replayed": is_replayed,
+            "parent_thread_id": subagent_parent_thread_id,
             **usage,
         }
         record["non_cached_input_tokens"] = integerish(record["non_cached_input_tokens"])
@@ -362,6 +376,15 @@ def parse_rollout(path, archived=False, config=None):
 
                 if top_type == "session_meta":
                     session_id = payload.get("id") or payload.get("session_id")
+                    if native_session_id is None:
+                        native_session_id = session_id
+                        native_session_timestamp = iso_parse(payload.get("timestamp") or line.get("timestamp"))
+                        source = payload.get("source")
+                        if isinstance(source, dict):
+                            subagent = source.get("subagent")
+                            spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+                            if isinstance(spawn, dict):
+                                subagent_parent_thread_id = spawn.get("parent_thread_id")
                     if session_id:
                         diag["session_ids"].add(str(session_id))
                         meta["session_id"] = session_id
@@ -397,7 +420,10 @@ def parse_rollout(path, archived=False, config=None):
                     prompt_source = pending["source"] if pending else None
                     prompt_client_id = pending.get("client_id") if pending else None
                     start_ts = timestamp or (pending.get("timestamp") if pending else None)
-                    active = _new_turn(start_ts, payload.get("turn_id"), meta, True, prompt, prompt_source, prompt_client_id)
+                    started_at = num(payload.get("started_at"))
+                    native_epoch = native_session_timestamp.timestamp() if native_session_timestamp else 0
+                    replayed = bool(subagent_parent_thread_id and started_at and native_epoch and started_at < native_epoch - 1)
+                    active = _new_turn(start_ts, payload.get("turn_id"), meta, True, prompt, prompt_source, prompt_client_id, replayed)
                     pending = None
                 elif top_type == "event_msg" and payload_type == "token_count":
                     if isinstance(payload.get("rate_limits"), dict):
@@ -516,6 +542,7 @@ def parse_import_file(path, config=None):
             "source": source, "source_confidence": "locally estimated", "timestamp": parsed.isoformat() if parsed else str(timestamp),
             "session_id": None, "thread_id": None, "turn_id": None, "model": model,
             "reasoning_effort": row.get("reasoning_effort"), "prompt_preview": preview,
+            "prompt_fingerprint": hashlib.sha256(preview.encode()).hexdigest() if preview else None,
             "root_prompt_preview": preview, "is_approval_followup": False,
             "category": category, "kind": "coding" if category in {"coding", "code review", "debugging", "testing"} else "chat",
             "workspace": row.get("workspace") or "", "project": row.get("project") or "",
@@ -526,6 +553,68 @@ def parse_import_file(path, config=None):
             "estimated_credits": round(credits, 6), **{key: integerish(value) for key, value in usage.items()},
         })
     return output
+
+
+def reconcile_request_replays(requests):
+    """Remove subagent history replays and attach native subagent work to its parent prompt."""
+    chosen = {}
+    passthrough = []
+    replay_duplicates = 0
+    for row in requests:
+        turn_id = row.get("turn_id") if row.get("source") == "codex" else None
+        if not turn_id:
+            passthrough.append(row)
+            continue
+        current = chosen.get(turn_id)
+        score = (not row.get("is_replayed"), bool(row.get("usage_available")), num(row.get("total_tokens")))
+        if current is None:
+            chosen[turn_id] = row
+        else:
+            replay_duplicates += 1
+            current_score = (not current.get("is_replayed"), bool(current.get("usage_available")), num(current.get("total_tokens")))
+            if score > current_score:
+                chosen[turn_id] = row
+    reconciled = passthrough + list(chosen.values())
+    parents = defaultdict(list)
+    for row in reconciled:
+        if row.get("source") == "codex" and not row.get("is_subagent") and row.get("session_id"):
+            parents[str(row["session_id"])].append(row)
+    for rows in parents.values():
+        rows.sort(key=lambda item: item.get("timestamp") or "")
+    linked_subagents = 0
+    for row in reconciled:
+        parent_id = row.get("parent_thread_id")
+        if not row.get("is_subagent") or row.get("is_replayed") or not parent_id:
+            continue
+        timestamp = row.get("timestamp") or ""
+        candidates = [item for item in parents.get(str(parent_id), []) if (item.get("timestamp") or "") <= timestamp]
+        if candidates:
+            parent = candidates[-1]
+            row["prompt_id"] = parent.get("prompt_id") or parent["id"]
+            row["root_prompt_preview"] = parent.get("root_prompt_preview") or parent.get("prompt_preview") or ""
+            linked_subagents += 1
+    prompt_retries_linked = 0
+    retry_groups = defaultdict(list)
+    for row in reconciled:
+        if row.get("source") == "codex" and row.get("session_id") and row.get("prompt_fingerprint") and not row.get("is_approval_followup"):
+            retry_groups[(str(row["session_id"]), row["prompt_fingerprint"])].append(row)
+    for group in retry_groups.values():
+        group.sort(key=lambda item: item.get("timestamp") or "")
+        previous = None
+        for row in group:
+            current_time = iso_parse(row.get("timestamp"))
+            previous_time = iso_parse(previous.get("timestamp")) if previous else None
+            if previous and current_time and previous_time and current_time - previous_time <= timedelta(minutes=15):
+                row["prompt_id"] = previous.get("prompt_id") or previous["id"]
+                row["root_prompt_preview"] = previous.get("root_prompt_preview") or previous.get("prompt_preview") or ""
+                prompt_retries_linked += 1
+            previous = row
+    reconciled.sort(key=lambda row: row.get("timestamp") or "")
+    return reconciled, {
+        "replayed_request_duplicates_suppressed": replay_duplicates,
+        "subagent_requests_linked": linked_subagents,
+        "prompt_retries_linked": prompt_retries_linked,
+    }
 
 
 class SessionIndex:
@@ -570,7 +659,7 @@ class SessionIndex:
                     requests.extend(parse_import_file(import_path, self.config))
             # Stable de-duplication protects against overlapping roots/import records.
             requests = list({row["id"]: row for row in requests}.values())
-            requests.sort(key=lambda row: row.get("timestamp") or "")
+            requests, reconciliation = reconcile_request_replays(requests)
             file_diags = [entry["diag"] for entry in self.entries.values()]
             session_ids = {sid for diag in file_diags for sid in diag.get("session_ids", [])}
             unknown = Counter()
@@ -599,6 +688,7 @@ class SessionIndex:
                 "files_with_unknown_event_types": sum(bool(diag.get("unknown_event_types") or diag.get("unknown_payload_types")) for diag in file_diags),
                 "requests_without_token_usage": sum(not row.get("usage_available") for row in requests if row.get("source") == "codex"),
                 "duplicate_token_events_suppressed": sum(diag.get("duplicate_token_events_suppressed", 0) for diag in file_diags),
+                **reconciliation,
                 "counter_resets": sum(diag.get("counter_resets", 0) for diag in file_diags),
                 "rate_limit_only_events": sum(diag.get("rate_limit_only_events", 0) for diag in file_diags),
                 "unassigned_token_events": sum(diag.get("unassigned_token_events", 0) for diag in file_diags),

@@ -98,6 +98,69 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(prompts[0]["total_tokens"], 220)
         self.assertEqual(prompts[0]["prompt_preview"], "Implement the requested dashboard")
 
+    def test_subagent_history_replay_is_deduplicated_and_linked_to_parent_prompt(self):
+        epoch = dashboard.iso_parse(BASE).timestamp()
+        parent_path = self.root / "parent.jsonl"
+        parent_lines = [
+            event("session_meta", {"id": "parent-thread", "timestamp": BASE, "cwd": "/workspace/demo"}),
+            event("event_msg", {"type": "task_started", "turn_id": "parent-turn", "started_at": epoch - 20}),
+            event("event_msg", {"type": "user_message", "message": "Review the dashboard"}),
+            token(usage(100, 20, 10)),
+            event("event_msg", {"type": "task_complete", "turn_id": "parent-turn"}),
+        ]
+        write_lines(parent_path, parent_lines)
+        child_path = self.root / "child.jsonl"
+        child_lines = [
+            event("session_meta", {"id": "child-thread", "timestamp": BASE, "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent-thread"}}}}),
+            event("session_meta", {"id": "parent-thread", "timestamp": "2026-07-01T00:00:00Z"}),
+            event("event_msg", {"type": "task_started", "turn_id": "parent-turn", "started_at": epoch - 20}),
+            event("event_msg", {"type": "user_message", "message": "Review the dashboard"}),
+            token(usage(100, 20, 10)),
+            event("event_msg", {"type": "task_complete", "turn_id": "parent-turn"}),
+            event("event_msg", {"type": "task_started", "turn_id": "child-turn", "started_at": epoch + 1}),
+            token(usage(150, 30, 15), usage(50, 10, 5)),
+            event("event_msg", {"type": "task_complete", "turn_id": "child-turn"}),
+        ]
+        write_lines(child_path, child_lines)
+        parent_rows, _ = dashboard.parse_rollout(parent_path)
+        child_rows, _ = dashboard.parse_rollout(child_path)
+        self.assertTrue(child_rows[0]["is_replayed"])
+        self.assertFalse(child_rows[1]["is_replayed"])
+        reconciled, diag = dashboard.reconcile_request_replays(parent_rows + child_rows)
+        prompts = dashboard.aggregate_prompts(reconciled)
+        self.assertEqual(len(reconciled), 2)
+        self.assertEqual(diag["replayed_request_duplicates_suppressed"], 1)
+        self.assertEqual(diag["subagent_requests_linked"], 1)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0]["request_count"], 2)
+        self.assertEqual(prompts[0]["total_tokens"], 165)
+
+    def test_aborted_prompt_retry_is_grouped_without_removing_request_rows(self):
+        first_path = self.root / "first.jsonl"
+        write_lines(first_path, [
+            event("session_meta", {"id": "same-session", "timestamp": BASE}),
+            event("event_msg", {"type": "task_started", "turn_id": "turn-aborted"}),
+            event("event_msg", {"type": "user_message", "message": "Fix the parser"}),
+            event("event_msg", {"type": "turn_aborted", "turn_id": "turn-aborted"}),
+        ])
+        second_path = self.root / "second.jsonl"
+        later = "2026-08-01T12:01:00Z"
+        write_lines(second_path, [
+            event("session_meta", {"id": "same-session", "timestamp": later}, later),
+            event("event_msg", {"type": "task_started", "turn_id": "turn-retry"}, later),
+            event("event_msg", {"type": "user_message", "message": "Fix the parser"}, later),
+            token(usage(10, 0, 2)),
+            event("event_msg", {"type": "task_complete", "turn_id": "turn-retry"}, later),
+        ])
+        first_rows, _ = dashboard.parse_rollout(first_path)
+        second_rows, _ = dashboard.parse_rollout(second_path)
+        reconciled, diag = dashboard.reconcile_request_replays(first_rows + second_rows)
+        prompts = dashboard.aggregate_prompts(reconciled)
+        self.assertEqual(len(reconciled), 2)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0]["request_count"], 2)
+        self.assertEqual(diag["prompt_retries_linked"], 1)
+
     def test_multiple_requests_in_one_session(self):
         first = common_start("turn-1", "Implement feature") + [
             token(usage(100, 20, 10)), event("event_msg", {"type": "task_complete", "turn_id": "turn-1"}),

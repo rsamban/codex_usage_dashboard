@@ -35,6 +35,12 @@ advancing token snapshot/model call for the root user prompt, counts locally det
 permission-approval tool calls, and attaches explicit approval-only follow-up turns to
 the preceding prompt. Request Explorer remains available for the underlying turn rows.
 
+Subagent rollout files can embed a timestamp-rewritten replay of their parent thread.
+The index suppresses those replay duplicates by stable `turn_id`, keeps the original
+parent record, and attaches only the subagent's native work to the prompt that spawned
+it. Short aborted/restarted handoffs of the same prompt are also grouped together while
+their individual turn rows remain visible in Request Explorer.
+
 Only a whitespace-normalized 180-character user-request preview is retained in the in-memory index and returned to the UI. Assistant responses, reasoning text, tool inputs/outputs, environment content, and full prompt bodies are not retained or logged.
 
 ## Recorded tokens versus estimated credits
