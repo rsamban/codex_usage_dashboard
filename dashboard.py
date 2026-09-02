@@ -140,8 +140,47 @@ def is_private_context(text):
     ))
 
 
+def redact_sensitive_text(text):
+    """Redact common local identifiers and credential shapes before UI display."""
+    value = str(text or "")
+    home = str(Path.home())
+    if home:
+        value = value.replace(home, "~")
+    account = Path.home().name
+    account_variants = {account, account.replace(".", " "), account.replace("_", " "), account.replace("-", " ")}
+    account_variants.update(part for part in re.split(r"[._-]+", account) if len(part) >= 3)
+    for variant in sorted(account_variants, key=len, reverse=True):
+        value = re.sub(re.escape(variant), "[user redacted]", value, flags=re.I)
+    value = re.sub(r"/Users/[^/\s`\"']+", "~", value)
+    value = re.sub(
+        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+        "[private key redacted]",
+        value,
+        flags=re.I | re.S,
+    )
+    value = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[email redacted]", value, flags=re.I)
+    value = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[API key redacted]", value)
+    value = re.sub(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{12,}\b", "[token redacted]", value)
+    value = re.sub(r"\bAKIA[A-Z0-9]{16}\b", "[access key redacted]", value)
+    value = re.sub(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b", "[JWT redacted]", value)
+    value = re.sub(r"(?i)(AccountKey=)[A-Za-z0-9+/=]{12,}", r"\1[redacted]", value)
+    value = re.sub(
+        r"(?i)\b(api[_-]?key|client[_-]?secret|access[_-]?token|password|credential)\b\s*([=:])\s*[\"']?[^\s\"',;]+",
+        r"\1\2[redacted]",
+        value,
+    )
+    value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{12,}", "Bearer [redacted]", value)
+    return value
+
+
+def redact_local_path(value):
+    if not value:
+        return ""
+    return redact_sensitive_text(str(value))
+
+
 def human_preview(text, limit=180):
-    compact = re.sub(r"\s+", " ", text or "").strip()
+    compact = re.sub(r"\s+", " ", redact_sensitive_text(text)).strip()
     return compact if len(compact) <= limit else compact[: limit - 1] + "…"
 
 
@@ -261,7 +300,7 @@ def parse_rollout(path, archived=False, config=None):
     path = Path(path)
     requests = []
     diag = {
-        "file": str(path), "parsed": False, "archived": archived, "parse_errors": 0,
+        "file": redact_local_path(path), "parsed": False, "archived": archived, "parse_errors": 0,
         "unknown_event_types": Counter(), "unknown_payload_types": Counter(),
         "duplicate_token_events_suppressed": 0, "counter_resets": 0,
         "rate_limit_only_events": 0, "unassigned_token_events": 0,
@@ -334,7 +373,7 @@ def parse_rollout(path, archived=False, config=None):
             "prompt_fingerprint": hashlib.sha256(human_preview(prompt).encode()).hexdigest() if prompt else None,
             "category": category,
             "kind": "coding" if category in {"coding", "code review", "debugging", "testing"} else "chat",
-            "workspace": turn.get("workspace") or meta.get("cwd") or "",
+            "workspace": redact_local_path(turn.get("workspace") or meta.get("cwd") or ""),
             "project": turn.get("project") or (Path(meta["cwd"]).name if meta.get("cwd") else ""),
             "status": status,
             "usage_available": usage_available,
@@ -344,7 +383,7 @@ def parse_rollout(path, archived=False, config=None):
             "_prompt_client_id": turn.get("prompt_client_id"),
             "_approval_response": is_approval_response(prompt),
             "non_cached_input_tokens": max(0, num(usage["input_tokens"]) - num(usage["cached_input_tokens"])),
-            "file": str(path),
+            "file": redact_local_path(path),
             "archived": archived,
             "rate_limits": turn.get("rate_limits") or latest_rate_limits,
             "is_subagent": is_subagent,
@@ -545,11 +584,11 @@ def parse_import_file(path, config=None):
             "prompt_fingerprint": hashlib.sha256(preview.encode()).hexdigest() if preview else None,
             "root_prompt_preview": preview, "is_approval_followup": False,
             "category": category, "kind": "coding" if category in {"coding", "code review", "debugging", "testing"} else "chat",
-            "workspace": row.get("workspace") or "", "project": row.get("project") or "",
+            "workspace": redact_local_path(row.get("workspace") or ""), "project": row.get("project") or "",
             "status": "imported", "usage_available": any(usage.values()), "usage_source": "import",
             "model_requests": 1, "approval_requests": 0,
             "non_cached_input_tokens": max(0, usage["input_tokens"] - usage["cached_input_tokens"]),
-            "file": str(path), "archived": False, "rate_limits": {},
+            "file": redact_local_path(path), "archived": False, "rate_limits": {},
             "estimated_credits": round(credits, 6), **{key: integerish(value) for key, value in usage.items()},
         })
     return output

@@ -62,6 +62,17 @@ class ParserTests(unittest.TestCase):
         write_lines(path, lines)
         return dashboard.parse_rollout(path)
 
+    def test_display_text_redacts_personal_paths_and_credentials(self):
+        fake_key = "sk-" + "A" * 24
+        text = f"User {Path.home().name}; contact person@example.com; api_key={fake_key}; file={Path.home()}/private/data.txt"
+        preview = dashboard.human_preview(text)
+        self.assertNotIn("person@example.com", preview)
+        self.assertNotIn(fake_key, preview)
+        self.assertNotIn(str(Path.home()), preview)
+        self.assertNotIn(Path.home().name, preview)
+        self.assertIn("[email redacted]", preview)
+        self.assertIn("~/private/data.txt", preview)
+
     def test_normal_request(self):
         lines = common_start() + [token(usage(100, 40, 20, 5)), event("event_msg", {"type": "task_complete", "turn_id": "turn-1"})]
         rows, diag = self.parse(lines)

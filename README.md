@@ -5,7 +5,7 @@ A dependency-free, localhost-only dashboard for recorded Codex usage plus option
 ## Run
 
 ```bash
-cd /Users/ramesh.sambandan/client_works/utils/codex_usage_dashboard
+cd /path/to/codex_usage_dashboard
 ./run_dashboard.sh
 ```
 
@@ -42,6 +42,10 @@ it. Short aborted/restarted handoffs of the same prompt are also grouped togethe
 their individual turn rows remain visible in Request Explorer.
 
 Only a whitespace-normalized 180-character user-request preview is retained in the in-memory index and returned to the UI. Assistant responses, reasoning text, tool inputs/outputs, environment content, and full prompt bodies are not retained or logged.
+
+Before display, previews redact common API-key, access-token, password, private
+home-path, local account-name, email, JWT, and cloud-credential patterns. Local paths
+below the current user's home directory are shown with `~` instead of the account name.
 
 ## Recorded tokens versus estimated credits
 
