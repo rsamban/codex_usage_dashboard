@@ -269,12 +269,49 @@ class ParserTests(unittest.TestCase):
         self.assertEqual((len(rows), diag["files_reparsed_this_scan"]), (2, 1))
 
     def test_credit_estimate_does_not_double_count_cache_or_reasoning(self):
-        config = {"rates": {"default": {"input": 100, "cached": 10, "cache_write": 100, "output": 500}}}
-        value = dashboard.estimate_credits("unknown", {
-            "input_tokens": 100, "cached_input_tokens": 40, "cache_write_input_tokens": 0,
+        config = {"rates": {"test-model": {"input": 100, "cached": 10, "cache_write": 100, "output": 500}}}
+        value = dashboard.estimate_credits("test-model", {
+            "input_tokens": 100, "cached_input_tokens": 40, "cache_write_input_tokens": 70,
             "output_tokens": 20, "reasoning_output_tokens": 5,
         }, config)
         self.assertEqual(value, 0.0164)
+
+    def test_gpt6_rates_and_unknown_model_are_not_fallback_priced(self):
+        recorded = usage(1_000_000, 400_000, 100_000, 80_000)
+        self.assertEqual(dashboard.estimate_credits("gpt-6-luna", recorded), 2.85)
+        self.assertEqual(dashboard.estimate_credits("gpt-6.1-sol", recorded), 56)
+        self.assertEqual(dashboard.estimate_credits("gpt-6-astra", recorded), 285)
+        self.assertIsNone(dashboard.estimate_credits("unlisted-model", recorded))
+
+    def test_monthly_usage_uses_token_times_across_month_boundary(self):
+        from datetime import datetime, timezone
+        september = "2026-09-30T23:59:00Z"
+        october = "2026-10-01T00:01:00Z"
+        def at(line, timestamp):
+            record = json.loads(line)
+            record["timestamp"] = timestamp
+            return json.dumps(record)
+        lines = [at(line, september) for line in common_start()]
+        lines += [
+            at(event("turn_context", {"model": "gpt-6-luna", "turn_id": "turn-1"}), september),
+            at(token(usage(1000, 400, 100)), september),
+            at(event("turn_context", {"model": "gpt-6.1-sol", "turn_id": "turn-1"}), october),
+            at(token(usage(2000, 800, 200), usage(1000, 400, 100)), october),
+            at(event("event_msg", {"type": "task_complete", "turn_id": "turn-1"}), october),
+        ]
+        rows, _ = self.parse(lines)
+        self.assertAlmostEqual(rows[0]["estimated_credits"], 0.05885)
+        summary = dashboard.make_summary(rows, datetime(2026, 10, 2, tzinfo=timezone.utc), {"timezone": "UTC"})
+        self.assertEqual(summary["current_month"]["requests"], 1)
+        self.assertEqual(summary["current_month"]["input_tokens"], 1000)
+        self.assertEqual(summary["current_month"]["estimated_credits"], 0.056)
+        local_summary = dashboard.make_summary(rows, datetime(2026, 10, 1, 1, tzinfo=timezone.utc), {"timezone": "America/Denver"})
+        self.assertEqual(local_summary["current_month_utc"]["input_tokens"], 1000)
+        self.assertEqual(local_summary["current_month_utc"]["codex_requests"], 1)
+        self.assertEqual(summary["current_month"]["codex_requests"], summary["current_month"]["requests"])
+        timeline = dashboard.timeline(rows, "month", config={"timezone": "UTC"})
+        self.assertEqual(len(timeline), 2)
+        self.assertAlmostEqual(sum(row["estimated_credits"] for row in timeline), rows[0]["estimated_credits"])
 
 
 if __name__ == "__main__":

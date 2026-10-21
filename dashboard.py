@@ -42,6 +42,10 @@ DEFAULT_CONFIG = {
     },
     # Estimated credits per 1M recorded tokens. Input means non-cached input.
     "rates": {
+        "GPT-6.1 Sol": {"input": 50, "cached": 2.5, "output": 250},
+        "GPT-6 Sol": {"input": 50, "cached": 5, "output": 250},
+        "GPT-6 Astra": {"input": 250, "cached": 25, "output": 1250},
+        "GPT-6 Luna": {"input": 2.5, "cached": 0.25, "output": 12.5},
         "GPT-5.6 Sol": {"input": 100, "cached": 10, "cache_write": 100, "output": 500},
         "GPT-5.6 Terra": {"input": 50, "cached": 5, "cache_write": 50, "output": 300},
         "GPT-5.6 Luna": {"input": 5, "cached": 0.5, "cache_write": 5, "output": 30},
@@ -198,6 +202,10 @@ def normalize_model(model):
         "gpt-5.6-sol": "GPT-5.6 Sol",
         "gpt-5.6-terra": "GPT-5.6 Terra",
         "gpt-5.6-luna": "GPT-5.6 Luna",
+        "gpt-6.1-sol": "GPT-6.1 Sol",
+        "gpt-6-sol": "GPT-6 Sol",
+        "gpt-6-astra": "GPT-6 Astra",
+        "gpt-6-luna": "GPT-6 Luna",
     }
     return aliases.get(raw.lower(), raw)
 
@@ -231,17 +239,17 @@ def estimate_credits(model, usage, config=None):
     config = config or CONFIG
     rates = config.get("rates", {})
     normalized = normalize_model(model)
-    rate = rates.get(normalized) or rates.get(str(model)) or rates.get("default", DEFAULT_CONFIG["rates"]["default"])
+    rate = next((value for key, value in rates.items() if key != "default" and normalize_model(key).lower() == normalized.lower()), None)
+    if rate is None:
+        return None
     total_input = num(usage.get("input_tokens"))
     cached = min(total_input, num(usage.get("cached_input_tokens")))
     non_cached = max(0, total_input - cached)
-    cache_write = num(usage.get("cache_write_input_tokens"))
     # reasoning_output_tokens is diagnostic detail within output_tokens, not extra output.
     output = num(usage.get("output_tokens"))
     credits = (
         non_cached * num(rate.get("input"))
         + cached * num(rate.get("cached"))
-        + cache_write * num(rate.get("cache_write", rate.get("input")))
         + output * num(rate.get("output"))
     ) / 1_000_000
     return round(credits, 6)
@@ -286,6 +294,7 @@ def _new_turn(timestamp, turn_id, meta, lifecycle, prompt="", prompt_source=None
         "prompt_client_id": prompt_client_id,
         "usage": empty_usage(),
         "usage_methods": set(),
+        "usage_events": [],
         "model_requests": 0,
         "approval_requests": 0,
         "replayed": replayed,
@@ -378,6 +387,7 @@ def parse_rollout(path, archived=False, config=None):
             "status": status,
             "usage_available": usage_available,
             "usage_source": "+".join(sorted(turn["usage_methods"])) if turn["usage_methods"] else None,
+            "usage_events": turn.get("usage_events", []),
             "model_requests": turn.get("model_requests", 0),
             "approval_requests": turn.get("approval_requests", 0),
             "_prompt_client_id": turn.get("prompt_client_id"),
@@ -392,7 +402,9 @@ def parse_rollout(path, archived=False, config=None):
             **usage,
         }
         record["non_cached_input_tokens"] = integerish(record["non_cached_input_tokens"])
-        record["estimated_credits"] = estimate_credits(record["model"], record, config)
+        estimates = [event["estimated_credits"] for event in record["usage_events"]]
+        record["estimated_credits"] = (round(sum(estimates), 6) if all(value is not None for value in estimates) else None) if estimates else estimate_credits(record["model"], record, config)
+        record["unpriced_usage"] = record["estimated_credits"] is None
         requests.append(record)
 
     try:
@@ -505,6 +517,14 @@ def parse_rollout(path, archived=False, config=None):
                     add_usage(active["usage"], increment)
                     active["usage_methods"].add(method)
                     active["model_requests"] += 1
+                    event_model = normalize_model(active.get("model") or meta.get("model"))
+                    active["usage_events"].append({
+                        "timestamp": timestamp.isoformat() if timestamp else active.get("timestamp"),
+                        "model": event_model,
+                        **{key: integerish(value) for key, value in increment.items()},
+                        "non_cached_input_tokens": max(0, increment["input_tokens"] - increment["cached_input_tokens"]),
+                        "estimated_credits": estimate_credits(event_model, increment, config),
+                    })
                 elif top_type == "event_msg" and payload_type in ("task_complete", "turn_aborted"):
                     if active is not None:
                         active["turn_id"] = payload.get("turn_id") or active.get("turn_id")
@@ -721,6 +741,7 @@ class SessionIndex:
                 "sessions": len(session_ids), "requests": len(requests),
                 "prompts": len(prompts),
                 "model_requests": sum(item.get("model_requests", 0) for item in requests),
+                "unpriced_models": sorted({event.get("model", "unknown") for row in requests for event in (row.get("usage_events") or [row]) if event.get("estimated_credits") is None}),
                 "approval_requests": sum(item.get("approval_requests", 0) for item in requests),
                 "oldest_request": min(dated) if dated else None, "newest_request": max(dated) if dated else None,
                 "unknown_event_types": dict(unknown), "unknown_payload_types": dict(unknown_payload),
@@ -749,7 +770,8 @@ def local_zone(config=None):
 
 def stats(rows):
     result = {
-        "requests": len(rows), "estimated_credits": 0, "credits": 0,
+        "requests": len({row.get("id", index) for index, row in enumerate(rows)}), "estimated_credits": 0, "credits": 0,
+        "unpriced_requests": len({row.get("id", index) for index, row in enumerate(rows) if row.get("estimated_credits") is None}),
         "input_tokens": 0, "cached_input_tokens": 0, "non_cached_input_tokens": 0,
         "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0,
         "total_tokens": 0, "codex_requests": 0, "chatgpt_requests": 0,
@@ -759,18 +781,30 @@ def stats(rows):
         for key in TOKEN_KEYS:
             result[key] += num(row.get(key))
         result["non_cached_input_tokens"] += num(row.get("non_cached_input_tokens"))
-        if row.get("source") == "codex":
-            result["codex_requests"] += 1
-        if row.get("source") == "chatgpt":
-            result["chatgpt_requests"] += 1
+    for source in ("codex", "chatgpt"):
+        result[source + "_requests"] = len({row.get("id", index) for index, row in enumerate(rows) if row.get("source") == source})
     result["estimated_credits"] = round(result["estimated_credits"], 6)
     result["credits"] = result["estimated_credits"]  # backwards-compatible UI field
     return {key: integerish(value) if key not in {"estimated_credits", "credits"} else value for key, value in result.items()}
 
 
+def accounting_rows(requests):
+    """Allocate usage to its recorded event time, including turns spanning months."""
+    output = []
+    for row in requests:
+        events = row.get("usage_events") or []
+        if not events:
+            output.append(row)
+        else:
+            for event in events:
+                output.append({"id": row["id"], "source": row.get("source"), **event})
+    return output
+
+
 def make_summary(requests, now=None, config=None):
     zone = local_zone(config)
-    local_now = (now or datetime.now(timezone.utc)).astimezone(zone)
+    utc_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    local_now = utc_now.astimezone(zone)
     hour_start = local_now.replace(minute=0, second=0, microsecond=0)
     today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = today_start - timedelta(days=today_start.weekday())
@@ -779,11 +813,13 @@ def make_summary(requests, now=None, config=None):
         "current_hour": (hour_start, local_now), "today": (today_start, local_now),
         "yesterday": (today_start - timedelta(days=1), today_start),
         "current_week": (week_start, local_now), "current_month": (month_start, local_now),
+        "current_month_utc": (utc_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), utc_now),
     }
     output = {"all_time": stats(requests), "all": stats(requests)}
+    events = accounting_rows(requests)
     for name, (start, end) in ranges.items():
         chosen = []
-        for row in requests:
+        for row in events:
             parsed = iso_parse(row.get("timestamp"))
             if parsed and start <= parsed.astimezone(zone) < end:
                 chosen.append(row)
@@ -807,7 +843,7 @@ def timeline(requests, mode="day", limit=30, config=None):
         mode = "day"
     groups = defaultdict(list)
     zone = local_zone(config)
-    for row in requests:
+    for row in accounting_rows(requests):
         parsed = iso_parse(row.get("timestamp"))
         if parsed:
             groups[bucket(parsed.astimezone(zone), mode)].append(row)
@@ -849,6 +885,7 @@ def aggregate_prompts(requests):
                 "models": set(), "reasoning_efforts": set(), "statuses": set(), "request_ids": [],
                 "request_count": 0, "model_requests": 0, "approval_requests": 0,
                 "usage_available": False, "estimated_credits": 0.0,
+                "unpriced_usage": False,
                 "non_cached_input_tokens": 0.0,
                 **empty_usage(),
             }
@@ -866,6 +903,7 @@ def aggregate_prompts(requests):
         group["approval_requests"] += int(num(row.get("approval_requests")))
         group["usage_available"] = group["usage_available"] or bool(row.get("usage_available"))
         group["estimated_credits"] += num(row.get("estimated_credits"))
+        group["unpriced_usage"] = group["unpriced_usage"] or row.get("estimated_credits") is None
         group["non_cached_input_tokens"] += num(row.get("non_cached_input_tokens"))
         for key in TOKEN_KEYS:
             group[key] += num(row.get(key))
@@ -875,6 +913,8 @@ def aggregate_prompts(requests):
         group["reasoning_effort"] = ", ".join(sorted(group.pop("reasoning_efforts")))
         group["status"] = ", ".join(sorted(group.pop("statuses")))
         group["estimated_credits"] = round(group["estimated_credits"], 6)
+        if group["unpriced_usage"]:
+            group["estimated_credits"] = None
         group["non_cached_input_tokens"] = integerish(group["non_cached_input_tokens"])
         for key in TOKEN_KEYS:
             group[key] = integerish(group[key])

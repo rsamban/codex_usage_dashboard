@@ -60,11 +60,30 @@ Estimated credits use the editable per-million-token rates in `config.json`:
 ```text
 non-cached input × input rate
 + cached input × cached rate
-+ cache-write input × cache-write rate
 + output × output rate
 ```
 
 `reasoning_output_tokens` is a subset of `output_tokens` in the observed rollouts, so it is shown separately but not charged a second time. These estimates are not exact billing values; local session files are not an OpenAI billing ledger.
+
+GPT-6.1 Sol, GPT-6 Sol, GPT-6 Astra, and GPT-6 Luna use the published
+[Standard-speed credit rates](https://learn.chatgpt.com/docs/pricing#token-rates),
+verified October 21, 2026. Codex credits have no separate cache-write charge.
+Unknown models are marked unpriced; the legacy `default` rate is never applied
+silently. Summary totals include only priced usage and expose `unpriced_requests`.
+Diagnostics list `unpriced_models`.
+
+Calendar summaries and timeline buckets use token-event timestamps, so a turn that
+starts in September and continues in October contributes only its October tokens
+to October. Request and Prompt Explorers show the complete turn/prompt estimates.
+Token events are priced using the model recorded when the usage occurred.
+The separate **Credit comparison · month (UTC)** card uses UTC month boundaries;
+**Current month (local)** retains the configured local timezone. This makes the
+period difference visible when comparing with an external usage dashboard.
+
+Codex Usage & Billing remains the source for actual credit consumption. Its period,
+included allowances, speed modes, discounts, or workspace scope can differ from
+the local calendar-month estimate. The dashboard does not rescale usage to match
+a manually reported balance.
 
 ## API
 

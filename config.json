@@ -9,6 +9,10 @@
     "unlimited_models": ["Instant", "GPT-5.6 Luna"]
   },
   "rates": {
+    "GPT-6.1 Sol": {"input": 50, "cached": 2.5, "output": 250},
+    "GPT-6 Sol": {"input": 50, "cached": 5, "output": 250},
+    "GPT-6 Astra": {"input": 250, "cached": 25, "output": 1250},
+    "GPT-6 Luna": {"input": 2.5, "cached": 0.25, "output": 12.5},
     "GPT-5.6 Sol": {"input": 100, "cached": 10, "cache_write": 100, "output": 500},
     "GPT-5.6 Terra": {"input": 50, "cached": 5, "cache_write": 50, "output": 300},
     "GPT-5.6 Luna": {"input": 5, "cached": 0.5, "cache_write": 5, "output": 30},
